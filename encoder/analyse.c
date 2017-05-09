@@ -1,7 +1,7 @@
 /*****************************************************************************
  * analyse.c: macroblock analysis
  *****************************************************************************
- * Copyright (C) 2003-2017 x264 project
+ * Copyright (C) 2003-2016 x264 project
  *
  * Authors: Laurent Aimar <fenrir@via.ecp.fr>
  *          Loren Merritt <lorenm@u.washington.edu>
@@ -147,7 +147,7 @@ const uint16_t x264_lambda_tab[QP_MAX_MAX+1] =
  161, 181, 203, 228, 256, 287, 323, 362, /* 56-63 */
  406, 456, 512, 575, 645, 724, 813, 912, /* 64-71 */
 1024,1149,1290,1448,1625,1825,2048,2299, /* 72-79 */
-2580,2896,                               /* 80-81 */
+2048,2299,                               /* 80-81 */
 };
 
 /* lambda2 = pow(lambda,2) * .9 * 256 */
@@ -275,6 +275,13 @@ static void x264_analyse_update_cache( x264_t *h, x264_mb_analysis_t *a );
 static uint16_t x264_cost_ref[QP_MAX+1][3][33];
 static UNUSED x264_pthread_mutex_t cost_ref_mutex = X264_PTHREAD_MUTEX_INITIALIZER;
 static uint16_t x264_cost_i4x4_mode[(QP_MAX+2)*32];
+
+/* SSIM RDO variables */
+int current_frame = -1;
+double mb_var[10000];
+double avg = 58;
+double c2;
+double scale_factor = 2.0;
 
 static int init_costs( x264_t *h, float *logs, int qp )
 {
@@ -423,8 +430,120 @@ static void x264_mb_analyse_init_qp( x264_t *h, x264_mb_analysis_t *a, int qp )
     h->mb.i_chroma_qp = h->chroma_qp_table[qp];
 }
 
+static double calc_variance( x264_t *h, pixel* mb, int mb_num, int stride )
+{ 
+    pixel* store_mb = mb;
+    double sum = 0;
+    for( int y = 0; y < 16; y++ )              
+    {                                        
+        for( int x = 0; x < 16; x++ )          
+        {                                     
+            sum += mb[x];                    
+        }                                     
+        mb += stride;                      
+    }
+
+    double mean = sum / 256;
+    double sq_diff_sum = 0;
+
+    for( int y = 0; y < 16; y++ )              
+    {                                        
+        for( int x = 0; x < 16; x++ )          
+        {                                     
+            double diff = mean - store_mb[x];
+            sq_diff_sum += diff * diff;                   
+        }                                     
+        store_mb += stride;                      
+    }
+
+    return sq_diff_sum / 256;
+}
+
+static void init_variance( x264_t *h )
+{
+    if (current_frame != h->i_frame)
+    {
+        double sum_var = 0;
+        for (int i=0; i<h->mb.i_mb_count; i++)
+        {
+            int mb_y = i / h->mb.i_mb_width;
+            int mb_x = i % h->mb.i_mb_width;
+            int stride = h->fenc->i_stride[0];
+            pixel *fenc = h->fenc->plane[0] + 16 * (mb_x + mb_y * stride);
+
+            mb_var[i] = calc_variance(h, fenc, i, stride);
+            sum_var += mb_var[i];
+        }
+
+        //c2 = sum_var / 10;
+        avg = 0;
+        for (int i=0; i<h->mb.i_mb_count; i++)
+        {
+            if (!isnan(log(scale_factor*mb_var[i] + c2))){
+                avg += log(scale_factor*mb_var[i] + c2);
+            }
+        }
+        avg /= h->mb.i_mb_count;
+        avg = exp(avg);
+        current_frame = h->i_frame;
+    }
+}
+
+static int cacl_new_lambda( x264_t *h, int lambda )
+{
+    int mb_index = h->mb.i_mb_y * h->mb.i_mb_width + h->mb.i_mb_x;
+    double new_lambda = (double)lambda * (scale_factor * mb_var[mb_index] + c2) / avg;
+    return (int) (new_lambda + 0.5);
+}
+
 static void x264_mb_analyse_init( x264_t *h, x264_mb_analysis_t *a, int qp )
 {
+    init_variance(h);
+    int lambda2 = x264_lambda2_tab[qp];
+    int new_lambda = cacl_new_lambda(h, lambda2);
+    int new_qp = qp;
+    while (1)
+    {
+        if (new_qp == 0 || new_qp == 81) 
+            break;
+
+        if (new_lambda < lambda2)
+        {
+            new_qp--;
+            if (x264_lambda2_tab[new_qp] < new_lambda)
+            {
+                if (abs(new_lambda - x264_lambda2_tab[new_qp]) > 
+                    abs(new_lambda - x264_lambda2_tab[new_qp + 1]))
+                    new_qp++;
+                break;
+            }
+            if (new_qp == 0) 
+                break;
+        }
+        else
+        {
+            new_qp++;
+            if (x264_lambda2_tab[new_qp] > new_lambda)
+            {
+                if (abs(new_lambda - x264_lambda2_tab[new_qp]) > 
+                    abs(new_lambda - x264_lambda2_tab[new_qp - 1]))
+                    new_qp--;
+                break;
+            }
+            if (new_qp == 81) 
+                break;
+        }
+    }
+
+   if (current_frame == 1)
+    {
+        // int mb_index = h->mb.i_mb_y * h->mb.i_mb_width + h->mb.i_mb_x;
+        // x264_log( h, X264_LOG_WARNING, "MB x: %d | y: %d | var: %f | avg: %f | qp: %d | new qp: %d\n", 
+        //     h->mb.i_mb_x, h->mb.i_mb_y, mb_var[mb_index], avg, qp, new_qp );
+    }
+
+    qp = new_qp;
+
     int subme = h->param.analyse.i_subpel_refine - (h->sh.i_type == SLICE_TYPE_B);
 
     /* mbrd == 1 -> RD mode decision */
@@ -2147,7 +2266,7 @@ static void x264_mb_analyse_inter_b16x16( x264_t *h, x264_mb_analysis_t *a )
             }
             else
             {
-                ALIGNED_ARRAY_N( pixel, pixuv, [2],[16*FENC_STRIDE] );
+                ALIGNED_ARRAY_16( pixel, pixuv, [2],[16*FENC_STRIDE] );
                 int chromapix = h->luma2chroma_pixel[PIXEL_16x16];
                 int v_shift = CHROMA_V_SHIFT;
 
